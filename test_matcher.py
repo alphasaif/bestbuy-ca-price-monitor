@@ -19,6 +19,7 @@ from matcher import (
     _check_strict_keyword_mismatch,
     _check_version_suffix_mismatch,
     _is_accessory,
+    _search_storage_form,
     dls_to_matcher_grade,
     normalize_storage,
     score_candidate,
@@ -59,6 +60,52 @@ class TestCanonicalizeStorageToken(unittest.TestCase):
             _canonicalize_storage_token("1tb"),
             _canonicalize_storage_token("256gb"),
         )
+
+
+class TestSearchStorageForm(unittest.TestCase):
+    """Search-query string uses TB form for big capacities; small stays GB.
+
+    Surfaced 2026-05-13 by listing 1834 (1024GB S25 Ultra Silverwhite). BB's
+    search index titles use 1TB form; the canonical 1024GB form buried the
+    target on page 2. This helper only affects query-string construction.
+    """
+
+    def test_1024gb_to_1tb(self):
+        self.assertEqual(_search_storage_form("1024GB"), "1TB")
+
+    def test_2048gb_to_2tb(self):
+        self.assertEqual(_search_storage_form("2048GB"), "2TB")
+
+    def test_sub_tb_passes_through(self):
+        self.assertEqual(_search_storage_form("256GB"), "256GB")
+        self.assertEqual(_search_storage_form("512GB"), "512GB")
+        self.assertEqual(_search_storage_form("128GB"), "128GB")
+
+    def test_already_tb_passes_through(self):
+        # Defensive — if upstream ever hands us "1TB" unconverted.
+        self.assertEqual(_search_storage_form("1TB"), "1TB")
+
+    def test_search_query_uses_tb_form_for_1024gb(self):
+        terms = _terms("Samsung", "Galaxy S25 Ultra 5G", "1024GB",
+                       color="Titanium Silverwhite")
+        q = terms.query()
+        self.assertIn("1TB", q)
+        self.assertNotIn("1024GB", q)
+        self.assertNotIn("1024gb", q.lower())  # belt + suspenders
+
+    def test_search_query_no_color_uses_tb_form(self):
+        terms = _terms("Samsung", "Galaxy S25 Ultra 5G", "1024GB",
+                       color="Titanium Silverwhite")
+        q = terms.query_without_color()
+        self.assertIn("1TB", q)
+        self.assertNotIn("1024GB", q)
+
+    def test_search_query_512gb_stays_gb(self):
+        terms = _terms("Samsung", "Galaxy S25 Ultra 5G", "512GB",
+                       color="Black")
+        q = terms.query()
+        self.assertIn("512GB", q)
+        self.assertNotIn("TB", q)
 
 
 def _terms(make, model, capacity, color=None, category="Cellphone"):

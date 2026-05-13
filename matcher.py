@@ -123,7 +123,7 @@ class SearchTerms:
             return " ".join(p for p in parts if p).strip()
         parts = [self.brand, self.model]
         if self.storage:
-            parts.append(self.storage)
+            parts.append(_search_storage_form(self.storage))
         if self.color:
             parts.append(self.color)
         return " ".join(p for p in parts if p).strip()
@@ -133,7 +133,7 @@ class SearchTerms:
         if self.is_watch:
             parts.append("GPS")
         elif self.storage:
-            parts.append(self.storage)
+            parts.append(_search_storage_form(self.storage))
         return " ".join(p for p in parts if p).strip()
 
     def query_without_storage(self) -> str:
@@ -198,6 +198,27 @@ def _canonicalize_storage_token(tok: str) -> str:
         return (tok or "").lower()
     n, u = int(m.group(1)), m.group(2)
     return f"{n * 1024}gb" if u == "tb" else f"{n}gb"
+
+
+def _search_storage_form(canonical: Optional[str]) -> Optional[str]:
+    """
+    Convert canonical ``1024GB``/``2048GB`` back to ``1TB``/``2TB`` for the
+    SEARCH-QUERY STRING only. BB's product titles use the TB form, so a
+    search for ``Samsung Galaxy S25 Ultra 1024GB ...`` buries 1TB listings
+    while ``Samsung Galaxy S25 Ultra 1TB ...`` surfaces them on page 1.
+
+    Internal storage comparisons (in score_candidate) keep using the
+    canonical GB form and are unaffected. This helper is for query-build only.
+    """
+    if not canonical:
+        return canonical
+    m = re.match(r"^(\d+)GB$", canonical)
+    if not m:
+        return canonical
+    n = int(m.group(1))
+    if n >= 1024 and n % 1024 == 0:
+        return f"{n // 1024}TB"
+    return canonical
 
 
 def normalize_brand(raw: Optional[str]) -> str:
