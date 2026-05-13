@@ -193,6 +193,93 @@ def _parse_price(text: str) -> Optional[float]:
         return None
 
 
+# --------------------------------------------------------------------------- #
+# DOM diagnostic — runs once per (search, product) on first selector timeout
+# of a process, so we can see what BestBuy is actually serving. The legacy
+# class-substring selectors (price__, productItemName, x-productListItem)
+# broke between 2026-04-23 and 2026-05-13; this dumps enough structure to
+# spot the new class names.
+# --------------------------------------------------------------------------- #
+
+_DIAGNOSED: set = set()
+
+
+async def _diagnose_dom(page: Page, context: str) -> None:
+    """One-shot DOM probe; logs only the first time `context` is seen."""
+    if context in _DIAGNOSED:
+        return
+    _DIAGNOSED.add(context)
+    logger = logging.getLogger("bestbuy.diag")
+    try:
+        info = await page.evaluate(
+            r"""
+            () => {
+                const o = { url: location.href, title: document.title };
+                // Heading texts
+                o.headings = [];
+                document.querySelectorAll("h1,h2,h3").forEach(h => {
+                    if (o.headings.length < 8) {
+                        o.headings.push((h.tagName + ":" + (h.textContent || "").trim()).slice(0, 120));
+                    }
+                });
+                // Classes containing interesting substrings
+                const wanted = /price|product|item|card|listing|title|name|seller|market/i;
+                const classes = new Set();
+                document.querySelectorAll("[class]").forEach(el => {
+                    const c = el.getAttribute("class") || "";
+                    c.split(/\s+/).forEach(t => { if (wanted.test(t)) classes.add(t); });
+                });
+                o.classes = [...classes].sort().slice(0, 100);
+                // Dollar-amount text-nodes + their parent's tag + class
+                o.prices = [];
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                let node;
+                while ((node = walker.nextNode())) {
+                    const m = node.textContent.match(/\$[0-9,]+\.\d{2}/);
+                    if (m && o.prices.length < 6) {
+                        const p = node.parentElement;
+                        o.prices.push({
+                            text: m[0],
+                            tag: p ? p.tagName : null,
+                            class: p ? (p.getAttribute("class") || "").slice(0, 220) : null,
+                            grandparent_class: p && p.parentElement ?
+                                (p.parentElement.getAttribute("class") || "").slice(0, 220) : null
+                        });
+                    }
+                }
+                // Product link sample (search page)
+                o.product_links = [];
+                document.querySelectorAll("a[href*='/product/']").forEach((a, i) => {
+                    if (o.product_links.length < 5) {
+                        o.product_links.push({
+                            text: (a.textContent || "").trim().slice(0, 80),
+                            href: (a.getAttribute("href") || "").slice(0, 120),
+                            class: (a.getAttribute("class") || "").slice(0, 120),
+                            parent_tag: a.parentElement ? a.parentElement.tagName : null,
+                            parent_class: a.parentElement ? (a.parentElement.getAttribute("class") || "").slice(0, 200) : null
+                        });
+                    }
+                });
+                // Body size signal — is this a real page or a tiny stub?
+                o.body_chars = (document.body.innerHTML || "").length;
+                return o;
+            }
+            """
+        )
+        # Log it on its own lines so it shows up clearly in CI output.
+        logger.warning("=== DIAG[%s] BEGIN ===", context)
+        logger.warning("url:           %s", info.get("url"))
+        logger.warning("title:         %s", info.get("title"))
+        logger.warning("body_chars:    %s", info.get("body_chars"))
+        logger.warning("headings:      %s", info.get("headings"))
+        logger.warning("price classes: %s", info.get("prices"))
+        logger.warning("product_links: %s", info.get("product_links"))
+        logger.warning("classes (filtered, max 100): %s", info.get("classes"))
+        logger.warning("=== DIAG[%s] END ===", context)
+    except Exception as exc:
+        logger.warning("DIAG[%s] failed: %s", context, exc)
+
+
 async def search_bestbuy(page: Page, query: str) -> List[Candidate]:
     url = SEARCH_URL_TEMPLATE.format(query=quote_plus(query))
     logger = logging.getLogger("bestbuy.search")
@@ -208,6 +295,7 @@ async def search_bestbuy(page: Page, query: str) -> List[Candidate]:
         )
     except PlaywrightTimeoutError:
         logger.warning("Search page selector timeout for: %s", query)
+        await _diagnose_dom(page, "search-page-timeout")
         return []
 
     try:
@@ -291,6 +379,7 @@ async def fetch_product_page(
         )
     except PlaywrightTimeoutError:
         logger.warning("Product page price selector timeout: %s", product_url)
+        await _diagnose_dom(page, "product-page-timeout")
         return None, None, []
 
     data = await page.evaluate(
