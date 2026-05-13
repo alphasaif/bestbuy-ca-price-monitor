@@ -1,0 +1,100 @@
+name: BestBuy Canada Price Monitor
+
+on:
+  # 6 AM & 6 PM Eastern — approx. 10/22 UTC during DST, 11/23 UTC in winter.
+  # 1hr DST drift is acceptable per project spec.
+  schedule:
+    - cron: "0 10,22 * * *"
+
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Process only first N listings (blank = all)"
+        required: false
+        default: ""
+        type: string
+      force:
+        description: "Bypass TTL — rescrape everything"
+        required: false
+        default: false
+        type: boolean
+      concurrency:
+        description: "Max concurrent browsers (default 5)"
+        required: false
+        default: "5"
+        type: string
+      dry_run:
+        description: "Dry run — don't hit BestBuy or write to Supabase"
+        required: false
+        default: false
+        type: boolean
+      listing_id:
+        description: "Single-listing dispatch: process exactly this assurant_listings.listing_id (overrides limit/force)"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install chromium --with-deps
+
+      - name: Run scraper
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          BESTBUY_PRICE_TTL_HOURS: "24"
+        run: |
+          FLAGS=""
+          LISTING_ID="${{ github.event.inputs.listing_id }}"
+          if [ -n "$LISTING_ID" ]; then
+            FLAGS="$FLAGS --listing-id $LISTING_ID"
+          fi
+          LIMIT="${{ github.event.inputs.limit }}"
+          if [ -n "$LIMIT" ]; then
+            FLAGS="$FLAGS --limit $LIMIT"
+          fi
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            FLAGS="$FLAGS --force"
+          fi
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            FLAGS="$FLAGS --dry-run"
+          fi
+          CONCURRENCY="${{ github.event.inputs.concurrency }}"
+          if [ -n "$CONCURRENCY" ] && [ "$CONCURRENCY" != "5" ]; then
+            FLAGS="$FLAGS --concurrency $CONCURRENCY"
+          fi
+          echo "Running: python scraper.py $FLAGS"
+          python scraper.py $FLAGS
+
+      - name: Upload results CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ github.run_id }}
+          path: results/
+          retention-days: 14
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 14
