@@ -37,15 +37,13 @@ on:
 
 jobs:
   scrape:
-    # Trying Windows runners — Ubuntu and macOS are both Akamai-blocked.
-    # Windows GH Actions runners draw from a different Azure VM pool with
-    # potentially distinct IP ranges. Final free experiment.
-    runs-on: windows-latest
+    # 2026-05-13: tested ubuntu-latest, macos-latest, windows-latest — all
+    # three GH Actions runner pools are Akamai-blocked for bestbuy.ca
+    # (every request returns a 234-byte 'Access Denied' stub). Will need
+    # a residential proxy or managed scraping API to get past Akamai.
+    # Reverting to ubuntu-latest as the cheapest baseline runner.
+    runs-on: ubuntu-latest
     timeout-minutes: 90
-
-    defaults:
-      run:
-        shell: bash  # use Git Bash for the run scraper step's bash syntax
 
     steps:
       - name: Checkout
@@ -61,8 +59,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Install Playwright Chromium
-        # --with-deps is Linux-only
-        run: python -m playwright install chromium
+        run: python -m playwright install chromium --with-deps
 
       - name: Run scraper
         env:
