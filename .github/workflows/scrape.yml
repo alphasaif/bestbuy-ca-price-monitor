@@ -37,10 +37,15 @@ on:
 
 jobs:
   scrape:
-    # Trying macOS runners — different IP pool than Ubuntu (Azure), might not
-    # be Akamai-flagged. Public repos get free unlimited minutes on macOS too.
-    runs-on: macos-latest
+    # Trying Windows runners — Ubuntu and macOS are both Akamai-blocked.
+    # Windows GH Actions runners draw from a different Azure VM pool with
+    # potentially distinct IP ranges. Final free experiment.
+    runs-on: windows-latest
     timeout-minutes: 90
+
+    defaults:
+      run:
+        shell: bash  # use Git Bash for the run scraper step's bash syntax
 
     steps:
       - name: Checkout
@@ -56,7 +61,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Install Playwright Chromium
-        # --with-deps is Linux-only; macOS already has the deps Chromium needs
+        # --with-deps is Linux-only
         run: python -m playwright install chromium
 
       - name: Run scraper
