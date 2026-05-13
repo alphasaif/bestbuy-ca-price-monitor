@@ -1,8 +1,12 @@
 name: BestBuy Canada Price Monitor
 
 on:
-  schedule:
-    - cron: "0 10,22 * * *"
+  # Cron disabled 2026-05-13. The Assurant-Procurement-Dashboard
+  # scheduler (running on Mac mini via launchd) orchestrates this
+  # workflow via workflow_dispatch: hourly post-sync runs + 72h force.
+  # Do not re-enable without coordinating with scheduler.ts.
+  # schedule:
+  #   - cron: "0 10,22 * * *"
 
   workflow_dispatch:
     inputs:
