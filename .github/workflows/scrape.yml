@@ -1,10 +1,11 @@
 name: BestBuy Canada Price Monitor
 
 on:
-  # 6 AM & 6 PM Eastern — approx. 10/22 UTC during DST, 11/23 UTC in winter.
-  # 1hr DST drift is acceptable per project spec.
-  schedule:
-    - cron: "0 10,22 * * *"
+  # Cron temporarily disabled while we test alternate runner pools to escape
+  # the Akamai IP block on GitHub Actions Ubuntu runners. Re-enable by
+  # uncommenting once we have a runner type with a clean IP.
+  # schedule:
+  #   - cron: "0 10,22 * * *"
 
   workflow_dispatch:
     inputs:
@@ -36,7 +37,9 @@ on:
 
 jobs:
   scrape:
-    runs-on: ubuntu-latest
+    # Trying macOS runners — different IP pool than Ubuntu (Azure), might not
+    # be Akamai-flagged. Public repos get free unlimited minutes on macOS too.
+    runs-on: macos-latest
     timeout-minutes: 90
 
     steps:
@@ -53,7 +56,8 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Install Playwright Chromium
-        run: python -m playwright install chromium --with-deps
+        # --with-deps is Linux-only; macOS already has the deps Chromium needs
+        run: python -m playwright install chromium
 
       - name: Run scraper
         env:
