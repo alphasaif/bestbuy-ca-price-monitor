@@ -353,12 +353,18 @@ def write_scrape_success(
     assurant_model: Optional[str] = None,
     assurant_capacity: Optional[str] = None,
     assurant_color: Optional[str] = None,
+    competing_offers_extras: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Best-effort across 3 calls:
       1. Upsert bestbuy_listings by product_url -> id
       2. Insert bestbuy_prices row (append-only)
       3. Upsert assurant_listing_matches
+
+    `competing_offers_extras` (optional, additive): extra keys to merge into the
+    competing_offers JSONB alongside the existing main_price / marketplace_prices /
+    matched_name. The existing keys are preserved verbatim for Dashboard
+    compatibility; extras are added next to them.
     """
     bb_id = _upsert_bestbuy_listing(
         client, product_url=url, product_title=matched_bb_name,
@@ -366,11 +372,17 @@ def write_scrape_success(
         capacity=assurant_capacity, color=assurant_color,
     )
 
-    competing_offers = {
+    competing_offers: Dict[str, Any] = {
         "main_price": main_price,
         "marketplace_prices": marketplace_prices,
         "matched_name": matched_bb_name,
     }
+    if competing_offers_extras:
+        # Caller-supplied keys go alongside the base three. We intentionally let
+        # caller extras win on key collisions so future scrapers can supply
+        # richer values for main_price etc. without us renaming things here.
+        competing_offers.update(competing_offers_extras)
+
     client.table("bestbuy_prices").insert({
         "bestbuy_listing_id": bb_id,
         "buy_box_price_cad": float(lowest_price),

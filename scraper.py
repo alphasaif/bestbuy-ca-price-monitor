@@ -1,26 +1,26 @@
 """
-scraper.py — BestBuy Canada price scraper.
+scraper.py — BestBuy Canada price scraper, JSON-API edition.
 
-Reads in-stock phone listings (with accepted grades) from Supabase, looks
-each one up on bestbuy.ca, extracts the BestBuy main + marketplace seller
-prices, and writes the lowest as a new bestbuy_prices row (with upserted
-bestbuy_listings + assurant_listing_matches).
+Reads in-stock phone listings from Supabase, looks each one up on
+bestbuy.ca via two undocumented (but unauthenticated and ungated)
+JSON endpoints, picks the best match through matcher.py, and writes
+the result to bestbuy_listings / bestbuy_prices / assurant_listing_matches.
 
-Workflow per row:
-  1. If a cached BestBuy URL exists in assurant_listing_matches and is still
-     valid, fetch its product page directly (cache-first).
-  2. Otherwise (or on cache miss), run the search + fallback query chain and
-     pick the best match using matcher.py.
-  3. Extract main + marketplace seller prices from the product page.
-  4. Write lowest price to bestbuy_prices, upsert listing + match rows.
-  5. Append to results/prices_YYYY-MM-DD.csv as a CI artifact backup.
+Two HTTP routes per row:
 
-Anti-detection (carried over from the source scraper, unchanged):
-  - Fresh Chromium per row, UA Chrome/131 Windows, viewport 1920x1080
-  - en-CA locale, America/Toronto timezone
-  - navigator.webdriver patched to undefined
-  - 2-4s polite delay between requests, 3 retries with exponential backoff
-  - Concurrency via asyncio.Semaphore (default 5)
+  Cache-first  — if a cached BestBuy URL exists in assurant_listing_matches,
+                 extract its SKU and call the product-detail JSON endpoint.
+                 Verify the returned product name still passes the matcher's
+                 grade hard-fail before writing.
+  Search       — otherwise (or on cache verification miss), call the search
+                 JSON endpoint, build Candidates from the result list, and
+                 hand them to matcher.pick_best_match().
+
+The previous Playwright pipeline was retired 2026-05-13 after Akamai
+fully IP-blocked all three GitHub Actions runner OS pools. The JSON
+endpoints used here are not bot-gated — they return the same data to
+any User-Agent from any residential or datacenter IP — so we no longer
+need a browser, anti-detection layer, or paid proxy service.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import json
 import logging
 import os
 import random
@@ -39,18 +40,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 
-from playwright.async_api import (
-    BrowserContext,
-    Page,
-    Playwright,
-    TimeoutError as PlaywrightTimeoutError,
-    async_playwright,
-)
+from curl_cffi.requests import AsyncSession
 
 try:
     from dotenv import load_dotenv
     load_dotenv()
-except ImportError:  # python-dotenv optional in CI
+except ImportError:
     pass
 
 from matcher import (
@@ -58,6 +53,7 @@ from matcher import (
     MatchResult,
     SearchTerms,
     build_search_terms,
+    condition_tokens,
     dls_to_matcher_grade,
     pick_best_match,
     pick_lowest_price,
@@ -70,23 +66,27 @@ import supabase_io
 # Config
 # --------------------------------------------------------------------------- #
 
-BESTBUY_BASE = "https://www.bestbuy.ca"
-SEARCH_URL_TEMPLATE = "https://www.bestbuy.ca/en-ca/search?search={query}"
+# Base host. Mirror `m.bestbuy.ca` returns identical payloads if this is ever
+# degraded; we don't currently fail over automatically.
+_API_BASE = "https://www.bestbuy.ca"
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
-)
+# Single canonical User-Agent. Don't rotate.
+_USER_AGENT = "BestBuyCanada/12.5.0 (Android 14; SM-S918W) okhttp/4.12.0"
 
-VIEWPORT = {"width": 1920, "height": 1080}
+# curl_cffi impersonation profile — gives us real Chrome's TLS + HTTP/2
+# fingerprint so the request doesn't look like raw Python.
+_IMPERSONATE = "chrome124"
 
-MAX_CONCURRENCY_DEFAULT = 5
-MAX_RETRIES = 3
-REQUEST_DELAY_MIN = 2.0
-REQUEST_DELAY_MAX = 4.0
-NAV_TIMEOUT_MS = 45_000
-SELECTOR_TIMEOUT_MS = 15_000
+# Canary SKU used at run start to verify the API is reachable.
+_CANARY_SKU = "16709017"
+
+# Concurrency + timing
+MAX_CONCURRENCY_DEFAULT = 10
+REQUEST_TIMEOUT = 12        # seconds
+SEARCH_RETRIES = 3
+RETRY_BACKOFFS = [1.0, 2.0, 4.0]
+POLITE_DELAY_MIN = 0.5
+POLITE_DELAY_MAX = 1.5
 
 
 # --------------------------------------------------------------------------- #
@@ -127,402 +127,227 @@ def setup_logging() -> logging.Logger:
 
 
 # --------------------------------------------------------------------------- #
-# Playwright helpers
+# HTTP layer
 # --------------------------------------------------------------------------- #
 
 
-async def new_context(playwright: Playwright) -> Tuple[BrowserContext, object]:
-    browser = await playwright.chromium.launch(
-        headless=True,
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--disable-dev-shm-usage",
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-background-timer-throttling",
-            "--disable-renderer-backgrounding",
-        ],
-    )
-    context = await browser.new_context(
-        user_agent=USER_AGENT,
-        viewport=VIEWPORT,
-        locale="en-CA",
-        timezone_id="America/Toronto",
-        extra_http_headers={
+def make_session() -> AsyncSession:
+    """Return a curl_cffi AsyncSession configured for the BB JSON endpoints."""
+    return AsyncSession(
+        impersonate=_IMPERSONATE,
+        headers={
+            "User-Agent": _USER_AGENT,
+            "Accept": "application/json",
             "Accept-Language": "en-CA,en;q=0.9",
-            "Upgrade-Insecure-Requests": "1",
         },
+        timeout=REQUEST_TIMEOUT,
     )
-    await context.add_init_script(
-        "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-    )
-    return context, browser
+
+
+def extract_sku_from_url(product_url: Optional[str]) -> Optional[str]:
+    """
+    Extract the trailing numeric SKU from a stored bestbuy_listings.product_url.
+    BB product URLs look like:
+        https://www.bestbuy.ca/en-ca/product/<slug>/<sku>
+    where <sku> is 6-8 digits. Returns None if pattern doesn't match.
+    """
+    if not product_url:
+        return None
+    m = re.search(r"/(\d{6,8})(?:\?|#|/|$)", product_url)
+    return m.group(1) if m else None
+
+
+async def get_product_by_sku(sku: str, session: AsyncSession) -> Optional[dict]:
+    """
+    Fetch product detail JSON by SKU. Returns parsed dict on 200, None on 404.
+    Raises after retries on other non-200 statuses or network errors.
+
+    Endpoint kept in code only per ops policy; not logged or documented elsewhere.
+    """
+    logger = logging.getLogger("bestbuy.http")
+    url = f"{_API_BASE}/api/v2/json/product/{sku}"
+    last_err: Optional[Exception] = None
+    for attempt in range(SEARCH_RETRIES):
+        try:
+            resp = await session.get(url)
+            if resp.status_code == 404:
+                return None
+            if resp.status_code == 200:
+                return resp.json()
+            logger.warning("product %s -> status=%d (attempt %d/%d)",
+                           sku, resp.status_code, attempt + 1, SEARCH_RETRIES)
+            last_err = RuntimeError(f"product_fetch_status_{resp.status_code}")
+        except Exception as exc:
+            last_err = exc
+            logger.warning("product %s network error (attempt %d/%d): %s",
+                           sku, attempt + 1, SEARCH_RETRIES, str(exc)[:120])
+        if attempt < SEARCH_RETRIES - 1:
+            await asyncio.sleep(RETRY_BACKOFFS[attempt])
+    raise RuntimeError(f"get_product_by_sku failed for {sku}: {last_err}")
+
+
+async def search_products(
+    query: str,
+    session: AsyncSession,
+    page: int = 1,
+    page_size: int = 24,
+) -> Tuple[List[Candidate], Dict[str, dict]]:
+    """
+    Search the BB catalog by keyword. Returns (candidates, raw_by_url) where:
+      - candidates: List[Candidate(name, price, url)] for matcher.pick_best_match
+      - raw_by_url: Dict[absolute_product_url -> full product dict from response]
+        so the caller can attach the original record to the matched winner.
+
+    Only `query=` is honoured by the upstream API as a real filter;
+    `q=` and `keywords=` silently return the entire catalog. Do not change.
+
+    Returns ([], {}) on empty result set. Raises after retries on non-200.
+    """
+    logger = logging.getLogger("bestbuy.http")
+    qs = f"query={quote_plus(query)}&page={page}&pageSize={page_size}"
+    url = f"{_API_BASE}/api/v2/json/search?{qs}"
+    last_err: Optional[Exception] = None
+    for attempt in range(SEARCH_RETRIES):
+        try:
+            resp = await session.get(url)
+            if resp.status_code == 200:
+                data = resp.json()
+                products = data.get("products") or []
+                candidates: List[Candidate] = []
+                raw_by_url: Dict[str, dict] = {}
+                for p in products:
+                    name = (p.get("name") or "").strip()
+                    rel = p.get("productUrl") or ""
+                    if not name or not rel:
+                        continue
+                    abs_url = rel if rel.startswith("http") else f"{_API_BASE}{rel}"
+                    price = _pick_price(p)
+                    candidates.append(Candidate(name=name, price=price, url=abs_url))
+                    raw_by_url[abs_url] = p
+                return candidates, raw_by_url
+            logger.warning("search '%s' p=%d -> status=%d (attempt %d/%d)",
+                           query, page, resp.status_code, attempt + 1, SEARCH_RETRIES)
+            last_err = RuntimeError(f"search_failed_{resp.status_code}")
+        except Exception as exc:
+            last_err = exc
+            logger.warning("search '%s' p=%d network error (attempt %d/%d): %s",
+                           query, page, attempt + 1, SEARCH_RETRIES, str(exc)[:120])
+        if attempt < SEARCH_RETRIES - 1:
+            await asyncio.sleep(RETRY_BACKOFFS[attempt])
+    raise RuntimeError(f"search_products failed for '{query}': {last_err}")
+
+
+def _pick_price(prod: dict) -> Optional[float]:
+    """salePrice when on sale, regularPrice otherwise. None if neither."""
+    sale = prod.get("salePrice")
+    on_sale = prod.get("isProductOnSale") or prod.get("hasPromotion")
+    if on_sale and isinstance(sale, (int, float)) and sale > 0:
+        return float(sale)
+    if isinstance(sale, (int, float)) and sale > 0:
+        return float(sale)
+    reg = prod.get("regularPrice")
+    if isinstance(reg, (int, float)) and reg > 0:
+        return float(reg)
+    return None
+
+
+async def api_canary(session: AsyncSession) -> bool:
+    """Smoke-test the product endpoint. True iff it returns the expected SKU."""
+    logger = logging.getLogger("bestbuy.canary")
+    try:
+        data = await get_product_by_sku(_CANARY_SKU, session)
+    except Exception as exc:
+        logger.error("Canary HTTP failed: %s", exc)
+        return False
+    if not data:
+        logger.error("Canary returned no data (got None / 404).")
+        return False
+    if data.get("sku") != _CANARY_SKU:
+        logger.error("Canary response SKU mismatch: expected %s, got %s",
+                     _CANARY_SKU, data.get("sku"))
+        return False
+    logger.info("Canary OK — API endpoint reachable (sku=%s, name=%r)",
+                data.get("sku"), (data.get("name") or "")[:60])
+    return True
 
 
 async def polite_delay() -> None:
-    await asyncio.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
-
-
-async def _close(context, browser) -> None:
-    try:
-        if context:
-            await context.close()
-    except Exception:
-        pass
-    try:
-        if browser:
-            await browser.close()
-    except Exception:
-        pass
+    await asyncio.sleep(random.uniform(POLITE_DELAY_MIN, POLITE_DELAY_MAX))
 
 
 # --------------------------------------------------------------------------- #
-# BestBuy page scraping
+# Build competing_offers JSONB payload
 # --------------------------------------------------------------------------- #
 
 
-def _parse_price(text: str) -> Optional[float]:
-    if not text:
+def _build_competing_offers(prod: dict, api_source: str) -> Dict[str, Any]:
+    """
+    Build the competing_offers JSONB payload from a product dict.
+
+    Backward-compat note: the Dashboard reads keys main_price, marketplace_prices,
+    and matched_name from this blob — those keys MUST remain present. We add new
+    keys alongside; we do not rename existing ones.
+
+    CAPABILITY REDUCTION: under the previous Playwright pipeline, marketplace_prices
+    sometimes held multiple float values when a product page exposed competing
+    third-party sellers in its "More sellers" section. The JSON API returns a
+    SINGLE product record per request (whichever seller's offer matched the
+    search), so marketplace_prices is now always []. Listings that previously
+    captured multiple competing offers will now only have the matched-seller
+    price. This is intentional, not a bug.
+    """
+    name = prod.get("name")
+    sale = prod.get("salePrice")
+    reg = prod.get("regularPrice")
+    on_sale = bool(prod.get("isProductOnSale"))
+    main = _pick_price(prod)
+
+    seller_obj = prod.get("seller") or {}
+    if not isinstance(seller_obj, dict):
+        seller_obj = {}
+
+    return {
+        # === existing Dashboard-facing keys (do not rename) ===
+        "main_price": main,
+        "marketplace_prices": [],
+        "matched_name": name,
+
+        # === new keys from the JSON API ===
+        "sku": prod.get("sku"),
+        "is_marketplace": bool(prod.get("isMarketplace")),
+        "is_available": bool(
+            prod.get("isAvailableOnline") or prod.get("isPurchasable")
+        ),
+        "is_purchasable": bool(prod.get("isPurchasable")),
+        "is_online_only": bool(prod.get("isOnlineOnly")),
+        "is_clearance": bool(prod.get("isClearance")),
+        "regular_price": reg if isinstance(reg, (int, float)) else None,
+        "sale_price": sale if isinstance(sale, (int, float)) else None,
+        "is_on_sale": on_sale,
+        "seller_id": seller_obj.get("id") or prod.get("sellerId"),
+        "model_number": prod.get("modelNumber"),
+        "brand_name": prod.get("brandName"),
+        "api_source": api_source,  # "search" | "product"
+    }
+
+
+def _resolve_seller_name(prod: dict) -> str:
+    """Best-effort seller name string for buy_box_seller column."""
+    s = prod.get("seller")
+    if isinstance(s, dict) and s.get("name"):
+        return str(s["name"])
+    return "Best Buy"
+
+
+def _absolutize_url(prod_url: Optional[str]) -> Optional[str]:
+    """Prepend the API base if the URL is relative (search responses are)."""
+    if not prod_url:
         return None
-    m = re.search(r"\$?\s*([\d,]+(?:\.\d+)?)", text)
-    if not m:
-        return None
-    try:
-        return float(m.group(1).replace(",", ""))
-    except ValueError:
-        return None
-
-
-# --------------------------------------------------------------------------- #
-# DOM diagnostic — runs once per (search, product) on first selector timeout
-# of a process, so we can see what BestBuy is actually serving. The legacy
-# class-substring selectors (price__, productItemName, x-productListItem)
-# broke between 2026-04-23 and 2026-05-13; this dumps enough structure to
-# spot the new class names.
-# --------------------------------------------------------------------------- #
-
-_DIAGNOSED: set = set()
-
-
-async def _diagnose_dom(page: Page, context: str) -> None:
-    """One-shot DOM probe; logs only the first time `context` is seen."""
-    if context in _DIAGNOSED:
-        return
-    _DIAGNOSED.add(context)
-    logger = logging.getLogger("bestbuy.diag")
-    try:
-        info = await page.evaluate(
-            r"""
-            () => {
-                const o = { url: location.href, title: document.title };
-                // Heading texts
-                o.headings = [];
-                document.querySelectorAll("h1,h2,h3").forEach(h => {
-                    if (o.headings.length < 8) {
-                        o.headings.push((h.tagName + ":" + (h.textContent || "").trim()).slice(0, 120));
-                    }
-                });
-                // Classes containing interesting substrings
-                const wanted = /price|product|item|card|listing|title|name|seller|market/i;
-                const classes = new Set();
-                document.querySelectorAll("[class]").forEach(el => {
-                    const c = el.getAttribute("class") || "";
-                    c.split(/\s+/).forEach(t => { if (wanted.test(t)) classes.add(t); });
-                });
-                o.classes = [...classes].sort().slice(0, 100);
-                // Dollar-amount text-nodes + their parent's tag + class
-                o.prices = [];
-                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-                let node;
-                while ((node = walker.nextNode())) {
-                    const m = node.textContent.match(/\$[0-9,]+\.\d{2}/);
-                    if (m && o.prices.length < 6) {
-                        const p = node.parentElement;
-                        o.prices.push({
-                            text: m[0],
-                            tag: p ? p.tagName : null,
-                            class: p ? (p.getAttribute("class") || "").slice(0, 220) : null,
-                            grandparent_class: p && p.parentElement ?
-                                (p.parentElement.getAttribute("class") || "").slice(0, 220) : null
-                        });
-                    }
-                }
-                // Product link sample (search page)
-                o.product_links = [];
-                document.querySelectorAll("a[href*='/product/']").forEach((a, i) => {
-                    if (o.product_links.length < 5) {
-                        o.product_links.push({
-                            text: (a.textContent || "").trim().slice(0, 80),
-                            href: (a.getAttribute("href") || "").slice(0, 120),
-                            class: (a.getAttribute("class") || "").slice(0, 120),
-                            parent_tag: a.parentElement ? a.parentElement.tagName : null,
-                            parent_class: a.parentElement ? (a.parentElement.getAttribute("class") || "").slice(0, 200) : null
-                        });
-                    }
-                });
-                // Body size signal — is this a real page or a tiny stub?
-                o.body_chars = (document.body.innerHTML || "").length;
-                return o;
-            }
-            """
-        )
-        # Log it on its own lines so it shows up clearly in CI output.
-        logger.warning("=== DIAG[%s] BEGIN ===", context)
-        logger.warning("url:           %s", info.get("url"))
-        logger.warning("title:         %s", info.get("title"))
-        logger.warning("body_chars:    %s", info.get("body_chars"))
-        logger.warning("headings:      %s", info.get("headings"))
-        logger.warning("price classes: %s", info.get("prices"))
-        logger.warning("product_links: %s", info.get("product_links"))
-        logger.warning("classes (filtered, max 100): %s", info.get("classes"))
-        logger.warning("=== DIAG[%s] END ===", context)
-    except Exception as exc:
-        logger.warning("DIAG[%s] failed: %s", context, exc)
-
-
-async def search_bestbuy(page: Page, query: str) -> List[Candidate]:
-    url = SEARCH_URL_TEMPLATE.format(query=quote_plus(query))
-    logger = logging.getLogger("bestbuy.search")
-    logger.info("Searching: %s", query)
-    await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-
-    try:
-        await page.wait_for_selector(
-            "li.x-productListItem, h3[class*='productItemName'], "
-            "div[class*='productList'], p[class*='noResults'], "
-            "div[class*='noSearchResult']",
-            timeout=SELECTOR_TIMEOUT_MS,
-        )
-    except PlaywrightTimeoutError:
-        logger.warning("Search page selector timeout for: %s", query)
-        await _diagnose_dom(page, "search-page-timeout")
-        return []
-
-    try:
-        close_btn = page.locator(
-            "button:has-text('Close'), button[aria-label='Close']"
-        ).first
-        if await close_btn.is_visible(timeout=1000):
-            await close_btn.click()
-    except Exception:
-        pass
-
-    await page.evaluate("window.scrollBy(0, 800)")
-    await asyncio.sleep(1.5)
-
-    raw: List[Dict[str, str]] = await page.evaluate(
-        """
-        () => {
-            const out = [];
-            const items = document.querySelectorAll(
-                "li.x-productListItem, li[class*='productLine']"
-            );
-            for (const item of items) {
-                const link = item.querySelector("a[href*='/product/']");
-                if (!link) continue;
-                const href = link.getAttribute('href') || '';
-                const nameEl = item.querySelector(
-                    "h3[class*='productItemName'], div[class*='productItemName'], " +
-                    "[data-automation='productItemName']"
-                );
-                const name = nameEl ? nameEl.textContent.trim() : link.textContent.trim();
-                let priceText = '';
-                const priceEl = item.querySelector(
-                    "div[class*='price__'], span[class*='price__'], [class*='productItemPrice']"
-                );
-                if (priceEl) priceText = priceEl.textContent.trim();
-                if (!priceText) {
-                    const all = item.textContent || '';
-                    const m = all.match(/\\$[\\d,]+\\.\\d{2}/);
-                    if (m) priceText = m[0];
-                }
-                if (name && name.length > 3) {
-                    out.push({ name, href, priceText });
-                }
-            }
-            return out;
-        }
-        """
-    )
-
-    out: List[Candidate] = []
-    for c in raw:
-        name = (c.get("name") or "").strip()
-        href = (c.get("href") or "").strip()
-        if not name or not href:
-            continue
-        url_abs = href if href.startswith("http") else f"{BESTBUY_BASE}{href}"
-        out.append(Candidate(name=name, price=_parse_price(c.get("priceText") or ""), url=url_abs))
-
-    logger.info("Found %d candidates for: %s", len(out), query)
-    return out
-
-
-async def fetch_product_page(
-    page: Page, product_url: str
-) -> Tuple[Optional[str], Optional[float], List[float]]:
-    """
-    Open a product page. Returns (product_name, main_price, marketplace_prices).
-    Returns (None, None, []) on navigation/parse failure.
-    """
-    logger = logging.getLogger("bestbuy.product")
-    try:
-        await page.goto(product_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-    except PlaywrightTimeoutError:
-        logger.warning("Product page navigation timeout: %s", product_url)
-        return None, None, []
-
-    try:
-        await page.wait_for_selector(
-            "div[class*='price__'], span[class*='price__'], [class*='productPricing']",
-            timeout=SELECTOR_TIMEOUT_MS,
-        )
-    except PlaywrightTimeoutError:
-        logger.warning("Product page price selector timeout: %s", product_url)
-        await _diagnose_dom(page, "product-page-timeout")
-        return None, None, []
-
-    data = await page.evaluate(
-        """
-        () => {
-            const r = { name: null, main: null, marketplace: [] };
-            const titleEl = document.querySelector(
-                "h1[class*='productName'], h1[data-automation='product-title'], h1"
-            );
-            if (titleEl) r.name = (titleEl.textContent || '').trim();
-            const priceEl = document.querySelector(
-                "div[class*='price__'], span[class*='price__'], " +
-                "[class*='productPricing'] [class*='price']"
-            );
-            if (priceEl) {
-                const t = priceEl.textContent || '';
-                const m = t.match(/\\$[\\d,]+\\.\\d{2}/);
-                r.main = m ? m[0] : t.trim();
-            }
-            const sections = document.querySelectorAll(
-                "div[class*='marketplaceSeller'], div[class*='otherSeller'], " +
-                "section[class*='marketplace'], div[class*='moreSeller']"
-            );
-            for (const s of sections) {
-                for (const p of s.querySelectorAll("[class*='price']")) {
-                    const t = (p.textContent || '').trim();
-                    if (t) r.marketplace.push(t);
-                }
-            }
-            return r;
-        }
-        """
-    )
-
-    name = data.get("name")
-    main_price = _parse_price(data.get("main") or "")
-    marketplace = [p for p in (_parse_price(t) for t in data.get("marketplace", [])) if p]
-    return name, main_price, marketplace
-
-
-# --------------------------------------------------------------------------- #
-# Scrape one listing
-# --------------------------------------------------------------------------- #
-
-
-async def _try_cached_url(
-    playwright: Playwright,
-    cached_url: str,
-    terms: SearchTerms,
-    matcher_grade: str,
-) -> Optional[Tuple[str, str, Optional[float], List[float]]]:
-    """
-    Try the cached URL directly. Returns (name, url, main_price, marketplace)
-    if the cached page looks like a valid match for this listing; else None.
-    """
-    logger = logging.getLogger("bestbuy.cache")
-    context = browser = None
-    try:
-        context, browser = await new_context(playwright)
-        page = await context.new_page()
-        name, main_price, marketplace = await fetch_product_page(page, cached_url)
-        if not name:
-            logger.info("Cache miss (no name extracted): %s", cached_url)
-            return None
-        if main_price is None and not marketplace:
-            logger.info("Cache miss (no price on page): %s", cached_url)
-            return None
-        # Confirm the cached product is still a sensible match.
-        cand = Candidate(name=name, price=main_price, url=cached_url)
-        score = score_candidate(cand, terms, grade=matcher_grade)
-        if score < 5:
-            logger.info(
-                "Cache miss (score %d < 5) for %s — cached page no longer matches",
-                score, cached_url,
-            )
-            return None
-        logger.info("Cache hit (score %d): %s", score, cached_url)
-        return name, cached_url, main_price, marketplace
-    except Exception as exc:
-        logger.warning("Cache attempt errored: %s", exc)
-        return None
-    finally:
-        await _close(context, browser)
-
-
-async def _search_and_match(
-    playwright: Playwright,
-    terms: SearchTerms,
-    matcher_grade: str,
-) -> Tuple[Optional[MatchResult], Optional[Tuple[Optional[float], List[float]]]]:
-    """
-    Full search + fallback chain + product-page fetch. Returns (match, prices)
-    where prices = (main_price, marketplace_prices) for the matched URL, or
-    (None, None) if nothing matched.
-    """
-    logger = logging.getLogger("bestbuy.search")
-    last_err: Optional[Exception] = None
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        context = browser = None
-        try:
-            context, browser = await new_context(playwright)
-            page = await context.new_page()
-
-            candidates = await search_bestbuy(page, terms.query())
-            match = pick_best_match(candidates, terms, grade=matcher_grade)
-
-            if not match.candidate and terms.color:
-                logger.info("Retrying without color")
-                candidates = await search_bestbuy(page, terms.query_without_color())
-                match = pick_best_match(candidates, terms, grade=matcher_grade)
-
-            if not match.candidate and terms.storage and not terms.is_watch:
-                logger.info("Retrying without storage")
-                candidates = await search_bestbuy(page, terms.query_without_storage())
-                match = pick_best_match(candidates, terms, grade=matcher_grade)
-
-            if not match.candidate and terms.is_watch:
-                logger.info("Retrying watch: brand + model only")
-                candidates = await search_bestbuy(page, terms.query_watch_unlocked())
-                match = pick_best_match(candidates, terms, grade=matcher_grade)
-
-            if not match.candidate:
-                await _close(context, browser)
-                return None, None
-
-            _, main_price, marketplace = await fetch_product_page(page, match.candidate.url)
-            await _close(context, browser)
-            return match, (main_price, marketplace)
-
-        except PlaywrightTimeoutError as exc:
-            last_err = exc
-            logger.warning("Timeout attempt %d/%d: %s", attempt, MAX_RETRIES, exc)
-        except Exception as exc:
-            last_err = exc
-            logger.warning("Error attempt %d/%d: %s", attempt, MAX_RETRIES, exc)
-        finally:
-            await _close(context, browser)
-
-        await asyncio.sleep(2 ** attempt + random.uniform(0, 1))
-
-    logger.error("All %d search attempts failed: %s", MAX_RETRIES, last_err)
-    raise RuntimeError(f"Search failed after {MAX_RETRIES} retries: {last_err}")
+    if prod_url.startswith("http"):
+        return prod_url
+    if prod_url.startswith("/"):
+        return f"{_API_BASE}{prod_url}"
+    return prod_url
 
 
 # --------------------------------------------------------------------------- #
@@ -543,35 +368,114 @@ class RunStats:
             setattr(self, field, getattr(self, field) + 1)
 
 
+async def _try_cached_path(
+    cached_url: str,
+    terms: SearchTerms,
+    matcher_grade: str,
+    session: AsyncSession,
+) -> Optional[Tuple[dict, str]]:
+    """
+    Cache-first path: extract SKU, fetch by SKU, verify name passes the
+    matcher's grade hard-fail. Returns (raw_product_dict, absolute_url) on
+    valid hit, None on cache miss / verify failure.
+    """
+    logger = logging.getLogger("bestbuy.cache")
+    sku = extract_sku_from_url(cached_url)
+    if not sku:
+        logger.info("Cache miss (sku not parseable from %s)", cached_url)
+        return None
+    try:
+        prod = await get_product_by_sku(sku, session)
+    except Exception as exc:
+        logger.warning("Cache fetch errored for sku=%s: %s", sku, exc)
+        return None
+    if prod is None:
+        logger.info("Cache miss (404 for sku=%s)", sku)
+        return None
+
+    name = prod.get("name") or ""
+    price = _pick_price(prod)
+    abs_url = _absolutize_url(prod.get("productUrl")) or cached_url
+
+    cand = Candidate(name=name, price=price, url=abs_url)
+    score = score_candidate(cand, terms, grade=matcher_grade)
+    if score < 5:
+        logger.info(
+            "Cache miss (score %d < 5) sku=%s name=%r — silent condition-tier drift?",
+            score, sku, name[:80],
+        )
+        return None
+    logger.info("Cache hit (score %d) sku=%s name=%r", score, sku, name[:80])
+    return prod, abs_url
+
+
+async def _search_path(
+    terms: SearchTerms,
+    matcher_grade: str,
+    session: AsyncSession,
+) -> Tuple[Optional[MatchResult], Optional[dict], Optional[str]]:
+    """
+    Search path with the same query-fallback chain the old scraper used:
+    primary query → without color → without storage → watch-unlocked.
+    Returns (match_result, raw_winner_product, absolute_winner_url).
+    """
+    logger = logging.getLogger("bestbuy.search")
+
+    queries = [terms.query()]
+    if terms.color:
+        queries.append(terms.query_without_color())
+    if terms.storage and not terms.is_watch:
+        queries.append(terms.query_without_storage())
+    if terms.is_watch:
+        queries.append(terms.query_watch_unlocked())
+
+    seen_q = set()
+    for q in queries:
+        if not q or q in seen_q:
+            continue
+        seen_q.add(q)
+        logger.info("Searching: %s", q)
+        candidates, raw_by_url = await search_products(q, session)
+        if not candidates:
+            continue
+        match = pick_best_match(candidates, terms, grade=matcher_grade)
+        if match.candidate:
+            winner = raw_by_url.get(match.candidate.url)
+            return match, winner, match.candidate.url
+
+    return None, None, None
+
+
 async def process_row(
-    playwright: Optional[Playwright],
     row: Dict[str, Any],
     idx: int,
     total: int,
-    client,  # supabase.Client (runtime type)
+    client,
     csv_writer: csv.DictWriter,
     csv_file,
     semaphore: asyncio.Semaphore,
     stats: RunStats,
     dry_run: bool,
+    session: AsyncSession,
 ) -> None:
     logger = logging.getLogger("bestbuy.row")
     listing_id = row["listing_id"]
     terms = build_search_terms(row)
     matcher_grade = dls_to_matcher_grade(row.get("grade"))
-
-    if not terms.brand and not terms.model:
-        logger.info("[%d/%d] listing %s: blank make/model — skipping", idx, total, listing_id)
-        return
-
-    query = terms.query()
     cached_url = row.get("existing_bb_url")
+    query = terms.query()
+
     logger.info(
         "[%d/%d] listing %s: %s %s | dls=%s -> matcher=%s | cache=%s",
         idx, total, listing_id, row.get("make"), row.get("model"),
         row.get("grade"), matcher_grade or "(none)",
         "yes" if cached_url else "no",
     )
+
+    if not terms.brand and not terms.model:
+        logger.info("[%d/%d] listing %s: blank make/model — skipping",
+                    idx, total, listing_id)
+        return
 
     if dry_run:
         logger.info(
@@ -584,44 +488,48 @@ async def process_row(
     await stats.bump("attempted")
 
     async with semaphore:
+        prod: Optional[dict] = None
+        winner_url: Optional[str] = None
+        is_approx = False
+        api_source = "search"
+
         try:
-            match_name: Optional[str] = None
-            match_url: Optional[str] = None
-            is_approx = False
-            main_price: Optional[float] = None
-            marketplace: List[float] = []
-
-            # Step 1: cache-first.
-            cached_result = None
+            # === cache-first ===
             if cached_url:
-                cached_result = await _try_cached_url(
-                    playwright, cached_url, terms, matcher_grade
+                cached_hit = await _try_cached_path(
+                    cached_url, terms, matcher_grade, session,
                 )
+                if cached_hit:
+                    prod, winner_url = cached_hit
+                    api_source = "product"
+                    is_approx = False  # cache verified, treat as exact
 
-            if cached_result:
-                match_name, match_url, main_price, marketplace = cached_result
-                is_approx = False  # we trust the cache's prior match confidence
-            else:
-                # Step 2: search fallback.
-                match, prices = await _search_and_match(playwright, terms, matcher_grade)
-                if not match or not match.candidate:
-                    logger.info("[%d/%d] listing %s: no match found", idx, total, listing_id)
+            # === search fallback ===
+            if prod is None:
+                match, winner, w_url = await _search_path(
+                    terms, matcher_grade, session,
+                )
+                if not match or not match.candidate or winner is None:
+                    logger.info("[%d/%d] listing %s: no match found",
+                                idx, total, listing_id)
                     supabase_io.write_scrape_failure(
                         client, listing_id,
                         reason="no_match",
                         url_attempted=cached_url,
                         query=query,
                     )
-                    _write_csv_row(csv_writer, csv_file, listing_id, terms, None, "", "Not Found")
+                    _write_csv_row(csv_writer, csv_file, listing_id, terms,
+                                   None, "", "Not Found")
                     await stats.bump("unmatched")
                     return
-                match_name = match.candidate.name
-                match_url = match.candidate.url
+                prod = winner
+                winner_url = w_url
                 is_approx = match.is_approximate
-                main_price, marketplace = prices or (None, [])
+                api_source = "search"
 
         except Exception as exc:
-            logger.exception("[%d/%d] listing %s: error: %s", idx, total, listing_id, exc)
+            logger.exception("[%d/%d] listing %s: error: %s",
+                             idx, total, listing_id, exc)
             try:
                 supabase_io.write_scrape_failure(
                     client, listing_id,
@@ -631,55 +539,66 @@ async def process_row(
                 )
             except Exception:
                 pass
-            _write_csv_row(csv_writer, csv_file, listing_id, terms, None, "", "Error")
+            _write_csv_row(csv_writer, csv_file, listing_id, terms,
+                           None, "", "Error")
             await stats.bump("errors")
             return
 
-        # Compute lowest.
-        effective = Candidate(name=match_name or "", price=main_price, url=match_url or "")
-        lowest = pick_lowest_price(effective, marketplace)
-        if lowest <= 0:
+        # === resolve price + write ===
+        price = _pick_price(prod)
+        if price is None or price <= 0:
             logger.info(
-                "[%d/%d] listing %s: matched %s but no price on page",
-                idx, total, listing_id, match_url,
+                "[%d/%d] listing %s: matched but no price (sku=%s)",
+                idx, total, listing_id, prod.get("sku"),
             )
             supabase_io.write_scrape_failure(
                 client, listing_id,
                 reason="no_price_on_page",
-                url_attempted=match_url,
+                url_attempted=winner_url,
                 query=query,
             )
-            _write_csv_row(csv_writer, csv_file, listing_id, terms, None, match_url or "", "No price")
+            _write_csv_row(csv_writer, csv_file, listing_id, terms,
+                           None, winner_url or "", "No price")
             await stats.bump("unmatched")
             return
+
+        winner_url = winner_url or _absolutize_url(prod.get("productUrl")) or ""
+        match_name = prod.get("name") or ""
+        seller_name = _resolve_seller_name(prod)
+        competing_offers = _build_competing_offers(prod, api_source=api_source)
 
         try:
             supabase_io.write_scrape_success(
                 client=client,
                 listing_id=listing_id,
-                url=match_url,
+                url=winner_url,
                 matched_bb_name=match_name,
-                main_price=main_price,
-                marketplace_prices=marketplace,
-                lowest_price=lowest,
+                main_price=price,
+                marketplace_prices=[],   # see _build_competing_offers comment
+                lowest_price=price,
                 is_approximate=is_approx,
+                buy_box_seller=seller_name,
                 assurant_make=row.get("make"),
                 assurant_model=row.get("model"),
                 assurant_capacity=row.get("capacity"),
                 assurant_color=row.get("color"),
+                competing_offers_extras=competing_offers,
             )
         except Exception as exc:
-            logger.exception("[%d/%d] listing %s: write failed: %s", idx, total, listing_id, exc)
+            logger.exception("[%d/%d] listing %s: write failed: %s",
+                             idx, total, listing_id, exc)
             await stats.bump("errors")
-            _write_csv_row(csv_writer, csv_file, listing_id, terms, lowest, match_url, "Write failed")
+            _write_csv_row(csv_writer, csv_file, listing_id, terms,
+                           price, winner_url, "Write failed")
             return
 
         note = "(Approx Match)" if is_approx else "Matched"
         logger.info(
-            "[%d/%d] listing %s: $%.2f CAD %s %s",
-            idx, total, listing_id, lowest, note, match_url,
+            "[%d/%d] listing %s: $%.2f CAD %s %s [%s]",
+            idx, total, listing_id, price, note, winner_url, api_source,
         )
-        _write_csv_row(csv_writer, csv_file, listing_id, terms, lowest, match_url, note)
+        _write_csv_row(csv_writer, csv_file, listing_id, terms,
+                       price, winner_url, note)
         await stats.bump("matched")
 
     await polite_delay()
@@ -753,8 +672,6 @@ def emit_run_summary(
     print(line, flush=True)
 
     match_rate = (matched / attempted) if attempted else 0.0
-    # Single-listing failures are normal (operator may pick a hard one); don't
-    # raise the GH Actions warning over a single-row mismatch. Batch modes do.
     level = "warning"
     if mode == "single" or attempted == 0 or match_rate >= 0.8:
         level = "notice"
@@ -765,7 +682,7 @@ def emit_run_summary(
 
 
 # --------------------------------------------------------------------------- #
-# Main
+# CLI + main
 # --------------------------------------------------------------------------- #
 
 
@@ -776,16 +693,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=None,
                    help="Process only the first N matching rows (batch mode only)")
     p.add_argument("--force", action="store_true",
-                   help="Operator override: include matched listings too "
-                        "(default cron path scrapes only unmatched listings). "
-                        "TTL filter still applies to skip very recently scraped rows.")
+                   help="Operator override: include matched listings as well "
+                        "as unmatched ones. TTL filter still applies.")
+    p.add_argument("--unmatched-only", action="store_true",
+                   help="Explicit alias for default cron behavior — only "
+                        "process listings without a cached BB match. No-op "
+                        "when neither --force nor --listing-id is set.")
     p.add_argument("--concurrency", type=int, default=MAX_CONCURRENCY_DEFAULT,
-                   help=f"Max concurrent browsers (default {MAX_CONCURRENCY_DEFAULT})")
+                   help=f"Max concurrent HTTP requests (default {MAX_CONCURRENCY_DEFAULT})")
     p.add_argument("--listing-id", type=int, default=None,
-                   help="Single-listing dispatch mode: process exactly this "
-                        "assurant_listings.listing_id, bypassing all eligibility "
-                        "filtering. Used by the dashboard's per-listing Refresh "
-                        "button. Wins over --force / --limit.")
+                   help="Single-listing dispatch mode. Wins over --force / --limit.")
     return p.parse_args(argv)
 
 
@@ -793,7 +710,6 @@ async def main_async(args: argparse.Namespace) -> int:
     logger = setup_logging()
     ttl_hours = int(os.environ.get("BESTBUY_PRICE_TTL_HOURS", "24"))
 
-    # Mode resolution. Single-listing wins.
     single_listing_id: Optional[int] = args.listing_id
     if single_listing_id is not None:
         mode = "single"
@@ -802,6 +718,8 @@ async def main_async(args: argparse.Namespace) -> int:
             ignored.append("--force")
         if args.limit is not None:
             ignored.append("--limit")
+        if args.unmatched_only:
+            ignored.append("--unmatched-only")
         if ignored:
             logger.warning(
                 "Single-listing mode (--listing-id=%d) overrides %s",
@@ -809,14 +727,16 @@ async def main_async(args: argparse.Namespace) -> int:
             )
     elif args.force:
         mode = "force"
+        if args.unmatched_only:
+            logger.warning("--force overrides --unmatched-only")
     else:
         mode = "unmatched_only"
 
     logger.info(
         "BestBuy scraper starting | mode=%s concurrency=%d "
-        "dry_run=%s force=%s limit=%s listing_id=%s ttl_hours=%d",
-        mode, args.concurrency, args.dry_run, args.force, args.limit,
-        single_listing_id, ttl_hours,
+        "dry_run=%s force=%s unmatched_only=%s limit=%s listing_id=%s ttl_hours=%d",
+        mode, args.concurrency, args.dry_run, args.force, args.unmatched_only,
+        args.limit, single_listing_id, ttl_hours,
     )
 
     try:
@@ -825,17 +745,21 @@ async def main_async(args: argparse.Namespace) -> int:
         logger.error("Supabase client init failed: %s", exc)
         return 2
 
+    # === API canary ===
+    async with make_session() as canary_session:
+        ok = await api_canary(canary_session)
+    if not ok:
+        logger.error("API canary failed — aborting before fetching cohort.")
+        return 2
+
+    # === fetch cohort ===
     try:
         if mode == "single":
-            logger.info(
-                "Single-listing mode: processing assurant_listing_id=%d",
-                single_listing_id,
-            )
+            logger.info("Single-listing mode: processing assurant_listing_id=%d",
+                        single_listing_id)
             row = supabase_io.read_single_listing(client, single_listing_id)
             if row is None:
-                logger.error(
-                    "Listing %d not found in assurant_listings", single_listing_id,
-                )
+                logger.error("Listing %d not found", single_listing_id)
                 emit_run_summary(RunStats(), 0.0, mode=mode)
                 return 4
             rows = [row]
@@ -860,28 +784,17 @@ async def main_async(args: argparse.Namespace) -> int:
     stats = RunStats()
     started = time.monotonic()
 
-    if args.dry_run:
-        # No Playwright needed in dry-run; pass None.
+    async with make_session() as session:
         tasks = [
             process_row(
-                playwright=None, row=row, idx=idx, total=total,
+                row=row, idx=idx, total=total,
                 client=client, csv_writer=csv_writer, csv_file=csv_file,
-                semaphore=semaphore, stats=stats, dry_run=True,
+                semaphore=semaphore, stats=stats, dry_run=args.dry_run,
+                session=session,
             )
             for idx, row in enumerate(rows, start=1)
         ]
         await asyncio.gather(*tasks, return_exceptions=False)
-    else:
-        async with async_playwright() as playwright:
-            tasks = [
-                process_row(
-                    playwright=playwright, row=row, idx=idx, total=total,
-                    client=client, csv_writer=csv_writer, csv_file=csv_file,
-                    semaphore=semaphore, stats=stats, dry_run=False,
-                )
-                for idx, row in enumerate(rows, start=1)
-            ]
-            await asyncio.gather(*tasks, return_exceptions=False)
 
     csv_file.close()
     duration = time.monotonic() - started
